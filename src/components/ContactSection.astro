@@ -24,179 +24,314 @@ const curatedSocials = socialNetworks.filter((social) =>
 )
 ---
 
-<section id="contact" class="py-8 scroll-mt-20 opacity-0">
+<section id="contact" data-tidycal-contact class="py-8 scroll-mt-20 opacity-0">
   <h2 class="mb-12 text-center font-display text-3xl font-semibold tracking-tight text-grayblue-900 dark:text-grayblue-100 gsap-fade-up transition-colors duration-300">{content.title}</h2>
   <div class="flex justify-center gsap-fade-up-noreverse">
     <div class="tidycal-embed" data-tidycal-placeholder data-path="jperusm/15-minute-meeting"></div>
     <script is:inline>
       (() => {
         const tidycalSrc = "https://asset-tidycal.b-cdn.net/js/embed.js";
-        // How long the embed gets before the static fallback is promoted.
+        // Give the vendor enough time to replace the placeholder before the
+        // static fallback error is promoted.
         const embedTimeoutMs = 3500;
 
         class TidyCalEmbedManager {
           constructor() {
+            // WeakMap keys keep detached placeholders collectible while their
+            // observers/timers still belong to this manager.
+            this.states = new WeakMap();
+            // Active states include idle observers, which must be cancelled
+            // before Astro swaps their retained DOM out of the document.
+            this.activeStates = new Set();
+            this.scriptStates = new WeakMap();
             this.loaderPromise = null;
             this.boundObserve = this.observe.bind(this);
+            this.boundBeforeSwap = this.cancelActiveStates.bind(this);
             this.initialized = false;
           }
 
           init() {
+            // Astro may execute this inline script again during navigation.
+            // Reuse the singleton and register each lifecycle listener once.
             if (!this.initialized) {
               document.addEventListener("astro:page-load", this.boundObserve);
               document.addEventListener("astro:after-swap", this.boundObserve);
+              document.addEventListener("astro:before-swap", this.boundBeforeSwap);
               this.initialized = true;
             }
 
             this.observe();
           }
 
-          // Lazy embed: the booking widget (third-party script + iframe) sits
-          // below the fold, so nothing downloads until the placeholder
-          // approaches the viewport. Falls back to immediate hydration when
-          // IntersectionObserver is unavailable.
+          // Idle IntersectionObservers retain their targets. Stop every active
+          // state before Astro detaches the old document subtree.
+          cancelActiveStates() {
+            for (const state of [...this.activeStates]) {
+              this.cancel(state);
+            }
+          }
+
+          // Lazy-load the below-the-fold widget. Each placeholder owns one
+          // observer/state, so repeated lifecycle events cannot double-init.
           observe() {
-            const placeholder = this.getPlaceholder();
-            if (!(placeholder instanceof HTMLDivElement)) {
+            const placeholders = document.querySelectorAll(
+              "[data-tidycal-contact] [data-tidycal-placeholder]",
+            );
+
+            placeholders.forEach((placeholder) => {
+              if (!(placeholder instanceof HTMLDivElement)) {
+                return;
+              }
+
+              const root = placeholder.closest("[data-tidycal-contact]");
+              const host = placeholder.parentElement;
+              if (
+                !(root instanceof HTMLElement) ||
+                !(host instanceof HTMLElement) ||
+                !root.isConnected
+              ) {
+                return;
+              }
+
+              let state = this.states.get(placeholder);
+              if (!state) {
+                state = {
+                  root,
+                  host,
+                  phase: "idle",
+                  observer: null,
+                  mutations: null,
+                  timer: null,
+                };
+                this.states.set(placeholder, state);
+                this.activeStates.add(state);
+              }
+
+              if (state.phase !== "idle" || state.observer) {
+                return;
+              }
+
+              // Older browsers without IntersectionObserver still get a
+              // working embed; they simply hydrate it immediately.
+              if (typeof window.IntersectionObserver !== "function") {
+                this.hydrate(placeholder, state);
+                return;
+              }
+
+              const observer = new IntersectionObserver(
+                (entries) => {
+                  if (!entries.some((entry) => entry.isIntersecting)) {
+                    return;
+                  }
+                  observer.disconnect();
+                  this.hydrate(placeholder, state);
+                },
+                // Start slightly before the section enters the viewport so the
+                // iframe has time to load while the user scrolls toward it.
+                { rootMargin: "200px 0px" },
+              );
+              state.observer = observer;
+              observer.observe(placeholder);
+            });
+          }
+
+          async hydrate(placeholder, state) {
+            // The phase is the single init guard. It replaces dataset flags,
+            // which became stale when TidyCal detached the placeholder.
+            if (state.phase !== "idle") {
+              return;
+            }
+            state.phase = "loading";
+            state.observer?.disconnect();
+            state.observer = null;
+
+            // A retained iframe can already coexist with the placeholder after
+            // navigation. Adopt it without requesting the vendor again, which
+            // would otherwise create a duplicate iframe.
+            if (this.hasEmbed(state)) {
+              this.markInjectedIframesLazy(state);
+              this.markReady(state);
               return;
             }
 
-            // One observer per placeholder: the immediate `init()` call and the
-            // `astro:page-load`/`astro:after-swap` listeners can land close
-            // together and must not both hydrate.
-            if (placeholder.dataset.tidycalObserved) {
+            // Watch before awaiting the vendor: TidyCal can replace the
+            // placeholder synchronously and may throw after inserting its
+            // iframe. The captured host remains the source of truth.
+            this.armWatchers(placeholder, state);
+
+            try {
+              await this.ensureScriptLoaded();
+            } catch {
+              // A concurrent iframe insertion wins over a late request error.
+              if (state.phase !== "loading") {
+                return;
+              }
+              if (this.isDisconnected(state)) {
+                this.cancel(state);
+                return;
+              }
+              this.showFallback(placeholder, state);
               return;
             }
-            placeholder.dataset.tidycalObserved = "true";
 
-            if (!("IntersectionObserver" in window)) {
-              this.hydrate();
+            // MutationObserver may already have completed this state while the
+            // vendor request was pending. A late vendor success must also
+            // replace a timeout fallback that was shown while the script loaded.
+            if (state.phase !== "loading" && state.phase !== "failed") {
               return;
             }
 
-            const observer = new IntersectionObserver(
-              (entries) => {
-                if (!entries.some((entry) => entry.isIntersecting)) {
+            if (this.hasEmbed(state)) {
+              this.markReady(state);
+              return;
+            }
+
+            // A view transition may remove this section while the script is
+            // loading. Do not init or alter a detached subtree.
+            if (this.isDisconnected(state)) {
+              this.cancel(state);
+              return;
+            }
+
+            // Some vendor loads resolve without exposing init. Keep the
+            // watchdog armed rather than declaring success or failure early.
+            if (!window.TidyCal?.init) {
+              return;
+            }
+
+            try {
+              window.TidyCal.init(placeholder);
+            } catch {
+              // TidyCal's iframe-resizer plumbing can throw after the iframe
+              // has already landed. Only an actually absent iframe waits for
+              // the watchdog fallback.
+              if (this.hasEmbed(state)) {
+                this.markReady(state);
+              }
+              return;
+            }
+
+            // init() may insert synchronously; otherwise the mutation observer
+            // or watchdog will resolve the still-loading state.
+            if (this.hasEmbed(state)) {
+              this.markReady(state);
+            }
+          }
+
+          // Arm both watchers before any vendor await so a fast replacement is
+          // observed and a silent vendor failure still has a bounded fallback.
+          armWatchers(placeholder, state) {
+            this.markInjectedIframesLazy(state);
+
+            if (typeof window.MutationObserver === "function") {
+              const mutations = new MutationObserver(() => {
+                if (state.phase !== "loading") {
                   return;
                 }
-                observer.disconnect();
-                this.hydrate();
-              },
-              // Start loading slightly before the section scrolls into view so
-              // the embed is ready by the time the user reaches it.
-              { rootMargin: "200px 0px" },
-            );
-            observer.observe(placeholder);
+                this.markInjectedIframesLazy(state);
+                if (this.hasEmbed(state)) {
+                  this.markReady(state);
+                }
+              });
+              // Observe only the captured embed host, never document.body.
+              mutations.observe(state.host, { childList: true, subtree: true });
+              state.mutations = mutations;
+            }
+
+            state.timer = window.setTimeout(() => {
+              this.watchdog(placeholder, state);
+            }, embedTimeoutMs);
           }
 
-          getPlaceholder() {
-            return document.querySelector(".tidycal-embed[data-tidycal-placeholder]");
+          // Success is based on the live host subtree. Placeholder attributes
+          // are intentionally ignored because the vendor detaches that node.
+          hasEmbed(state) {
+            return Boolean(state.host.querySelector("iframe.tidycal-embed"));
           }
 
-          // Promote the always-visible fallback: hide the (empty) placeholder
-          // and reveal the embed-error line inside the fallback panel.
-          showFallbackError(placeholder) {
+          // Stamp only iframes inside this embed host; childList observation
+          // means setting the loading attribute cannot retrigger the observer.
+          markInjectedIframesLazy(state) {
+            state.host.querySelectorAll("iframe").forEach((iframe) => {
+              iframe.loading = "lazy";
+            });
+          }
+
+          watchdog(placeholder, state) {
+            // Ready/failed/cancelled states are terminal; stale timers are inert.
+            if (state.phase !== "loading") {
+              return;
+            }
+
+            // A swapped-away section must not receive fallback UI changes.
+            if (this.isDisconnected(state)) {
+              this.cancel(state);
+              return;
+            }
+
+            if (this.hasEmbed(state)) {
+              this.markReady(state);
+              return;
+            }
+
+            this.showFallback(placeholder, state);
+          }
+
+          isDisconnected(state) {
+            // TidyCal may detach only the placeholder while keeping the embed
+            // host alive. Only a removed section/host should cancel cleanup.
+            return !state.root.isConnected || !state.host.isConnected;
+          }
+
+          markReady(state) {
+            if (state.phase !== "loading" && state.phase !== "failed") {
+              return;
+            }
+            state.phase = "ready";
+            this.stopWatchers(state);
+
+            // Success explicitly keeps the scoped error hidden, including when
+            // a previous state briefly exposed it.
+            const errorLine = state.root.querySelector("[data-tidycal-error]");
+            if (errorLine instanceof HTMLElement) {
+              errorLine.classList.add("hidden");
+            }
+          }
+
+          showFallback(placeholder, state) {
+            if (state.phase !== "loading") {
+              return;
+            }
+            state.phase = "failed";
+            this.stopWatchers(state);
             placeholder.style.display = "none";
-            const errorLine = document.querySelector("[data-tidycal-error]");
+
+            // Never query globally: another contact section must not be hidden
+            // or have its error message revealed by this widget.
+            const errorLine = state.root.querySelector("[data-tidycal-error]");
             if (errorLine instanceof HTMLElement) {
               errorLine.classList.remove("hidden");
             }
           }
 
-          async hydrate() {
-            const placeholder = this.getPlaceholder();
-            if (!(placeholder instanceof HTMLDivElement)) {
+          cancel(state) {
+            if (state.phase === "ready" || state.phase === "failed") {
               return;
             }
-
-            try {
-              await this.ensureScriptLoaded();
-            } catch {
-              this.showFallbackError(placeholder);
-              return;
-            }
-
-            if (!window.TidyCal?.init) {
-              this.showFallbackError(placeholder);
-              return;
-            }
-
-            if (!placeholder.hasAttribute("data-tidycal-placeholder")) {
-              return;
-            }
-
-            // Per-placeholder init guard: the immediate `init()` call and the
-            // `astro:page-load`/`astro:after-swap` listeners can land close
-            // together — without this flag the embed script would init the
-            // same placeholder twice.
-            if (placeholder.dataset.tidycalInit) {
-              return;
-            }
-            placeholder.dataset.tidycalInit = "true";
-
-            // Watch and stamp BEFORE init: TidyCal replaces the placeholder
-            // node synchronously inside init() and its resize plumbing can
-            // throw mid-render, so the observer must already be watching when
-            // the iframe lands.
-            this.markInjectedIframesLazy(placeholder);
-
-            try {
-              window.TidyCal.init(placeholder);
-            } catch {
-              // TidyCal's script may throw after it has already inserted the
-              // iframe (its own iframe-resizer plumbing). Only fall back to
-              // the static links when no embed actually appeared.
-              if (!document.querySelector("iframe.tidycal-embed")) {
-                this.showFallbackError(placeholder);
-                return;
-              }
-            }
-
-            // Watchdog: when the embed script still has not replaced the
-            // placeholder after a few seconds (blocked request, silent
-            // failure), fall back to the static links. Armed once per
-            // placeholder so repeated hydrations do not stack timers.
-            if (!placeholder.dataset.tidycalWatchdog) {
-              placeholder.dataset.tidycalWatchdog = "true";
-              window.setTimeout(() => {
-                if (placeholder.hasAttribute("data-tidycal-placeholder")) {
-                  this.showFallbackError(placeholder);
-                }
-              }, embedTimeoutMs);
-            }
+            state.phase = "cancelled";
+            this.stopWatchers(state);
           }
 
-          // TidyCal builds its iframe on its own schedule (and may swap the
-          // placeholder node for it), so watch the parent subtree briefly and
-          // mark every injected iframe lazy. Harmless if the iframe already
-          // carries the attribute.
-          markInjectedIframesLazy(placeholder) {
-            const stamp = (node) => {
-              if (node instanceof HTMLIFrameElement) {
-                node.loading = "lazy";
-              }
-            };
-
-            const scope = placeholder.parentElement ?? document.body;
-            scope.querySelectorAll("iframe").forEach(stamp);
-
-            if (!("MutationObserver" in window)) {
-              return;
+          stopWatchers(state) {
+            state.observer?.disconnect();
+            state.observer = null;
+            state.mutations?.disconnect();
+            state.mutations = null;
+            if (state.timer !== null) {
+              window.clearTimeout(state.timer);
+              state.timer = null;
             }
-
-            const mutationObserver = new MutationObserver((records) => {
-              for (const record of records) {
-                for (const node of record.addedNodes) {
-                  stamp(node);
-                  if (node instanceof Element) {
-                    node.querySelectorAll("iframe").forEach(stamp);
-                  }
-                }
-              }
-            });
-            mutationObserver.observe(scope, { childList: true, subtree: true });
-            // Stop watching once the embed has had time to settle.
-            window.setTimeout(() => mutationObserver.disconnect(), embedTimeoutMs);
+            this.activeStates.delete(state);
           }
 
           ensureScriptLoaded() {
@@ -208,24 +343,60 @@ const curatedSocials = socialNetworks.filter((social) =>
               return this.loaderPromise;
             }
 
-            this.loaderPromise = new Promise((resolve, reject) => {
-              const existingScript = document.querySelector("script[data-tidycal-script='true']");
-              if (existingScript instanceof HTMLScriptElement) {
-                existingScript.addEventListener("load", () => resolve(), { once: true });
-                existingScript.addEventListener("error", reject, { once: true });
-                return;
+            let script = document.querySelector(
+              "script[data-tidycal-script='true']",
+            );
+            if (script instanceof HTMLScriptElement) {
+              const status = this.scriptStates.get(script);
+              if (status === "loaded") {
+                return Promise.resolve();
+              }
+              // A failed request must not poison later navigations forever.
+              // Remove only our rejected script so the next section can retry.
+              if (status === "error") {
+                script.remove();
+                script = null;
+              }
+            }
+
+            const loaderPromise = new Promise((resolve, reject) => {
+              if (!(script instanceof HTMLScriptElement)) {
+                script = document.createElement("script");
+                script.src = tidycalSrc;
+                script.async = true;
+                script.dataset.tidycalScript = "true";
+                this.scriptStates.set(script, "pending");
+                document.head.appendChild(script);
               }
 
-              const script = document.createElement("script");
-              script.src = tidycalSrc;
-              script.async = true;
-              script.dataset.tidycalScript = "true";
-              script.addEventListener("load", () => resolve(), { once: true });
-              script.addEventListener("error", reject, { once: true });
-              document.head.appendChild(script);
+              script.addEventListener(
+                "load",
+                () => {
+                  this.scriptStates.set(script, "loaded");
+                  resolve();
+                },
+                { once: true },
+              );
+              script.addEventListener(
+                "error",
+                () => {
+                  this.scriptStates.set(script, "error");
+                  reject(new Error("TidyCal script failed to load"));
+                },
+                { once: true },
+              );
             });
 
-            return this.loaderPromise;
+            this.loaderPromise = loaderPromise;
+            // Let later placeholders retry instead of permanently reusing a
+            // rejected promise. The caller still receives the rejection.
+            loaderPromise.catch(() => {
+              if (this.loaderPromise === loaderPromise) {
+                this.loaderPromise = null;
+              }
+            });
+
+            return loaderPromise;
           }
         }
 
@@ -239,7 +410,7 @@ const curatedSocials = socialNetworks.filter((social) =>
       never loads — no JS guessing required. The `data-tidycal-error` line is
       revealed by the watchdog above when the embed fails. */}
   <div class="mx-auto mt-10 max-w-2xl rounded-card-lg bg-white/80 dark:bg-grayblue-800/70 backdrop-blur-sm border border-grayblue-200/80 dark:border-grayblue-700/60 p-8 lg:p-10 shadow-soft text-center gsap-fade-up-noreverse">
-    <p data-tidycal-error class="hidden mb-6 text-sm italic text-grayblue-500 dark:text-grayblue-400">
+    <p data-tidycal-error role="status" aria-live="polite" aria-atomic="true" class="hidden mb-6 text-sm italic text-grayblue-500 dark:text-grayblue-400">
       {content.embedError}
     </p>
     <p class="text-base lg:text-lg leading-relaxed text-grayblue-700 dark:text-grayblue-300">
@@ -265,7 +436,7 @@ const curatedSocials = socialNetworks.filter((social) =>
       {
         curatedSocials.map((socialNetwork) => (
           <a
-            aria-label={socialNetwork.name}
+            aria-label={socialNetwork.name === 'Email' ? content.emailLabel : socialNetwork.name}
             href={socialNetwork.url}
             class="text-grayblue-600 dark:text-grayblue-300 hover:text-blue-500 dark:hover:text-blue-300 transition-all duration-300 hover:scale-110"
           >
